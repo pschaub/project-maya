@@ -284,7 +284,7 @@ struct MoeDev {
     unsigned long long* plan_ptr = nullptr;    // [8]
     float* plan_w = nullptr;                   // [8]
     int* plan_id = nullptr;                    // [8]
-    unsigned long long* fetch_src = nullptr;   // [8] host-mapped source (0 = nothing to fetch for entry i)
+    unsigned long long* fetch_src = nullptr;   // [8] host-mapped source (0 = nothing to fetch for entry i; | 1: streamed)
     unsigned long long* pf_src = nullptr;      // [8] the NEXT layer's predicted experts being prefetched: source,
     unsigned long long* pf_dst = nullptr;      // [8] ... their (claimed spare) slot,
     int* pf_n = nullptr;                       // ... and how many (the side-stream fetch kernel reads these)
@@ -300,6 +300,8 @@ struct MoeDev {
                                                //     RAM-tier experts go to the host, the hot ones are promoted
     volatile int* route_error = nullptr;       // host-mapped, first invalid route: 4 * layer + kind (1..3)
     const int* skip = nullptr;                 // set_skip's flag: non-zero = the experts' kernels do nothing
+    unsigned int* landed = nullptr;            // [8 x 32] STRATA_GLM_STREAM_FETCH: chunk (i, bit) seen landed in the
+                                               //     response of this seq (its group's first block tells the others)
     // moe_experts_multi: mt_T tokens in one launch, token t's plan at plan_ptr / plan_w + 8 t and its rows at these
     // strides (q8_1 blocks: its FFN input, its h, its shared expert's h; floats: its output, its CPU part)
     int mt_T = 1;
@@ -345,6 +347,12 @@ struct MoeResponse {
     volatile unsigned int seq;
     unsigned int ptr_mask;            // plan entries the host made resident: ptr[i] valid
     unsigned long long ptr[8];
+    // STRATA_GLM_STREAM_FETCH: an entry whose ptr[i] has bit 0 set was answered before its disk reads finished;
+    // ready[i] collects its chunks as they land (bit part * s_chunks + chunk, fast_read_part's layout of a blob
+    // [gate s_gu | up s_gu | down s_dn] in s_chunks pieces a part)
+    unsigned int ready[8];
+    unsigned int s_chunks;
+    unsigned long long s_gu, s_dn;
     int n_upd;                        // table updates: tab[key] = val
     int upd_key[64];
     unsigned long long upd_val[64];
@@ -404,7 +412,8 @@ void moe_cpu_wait_streams(const MoeDev& d, int n_embd, const float* post, float*
 void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s);
 /// Waits (on the device) for the host's response when the last route had misses, then applies it.
 void moe_wait(const MoeDev& d, int n_embd, cudaStream_t s);
-/// Copies every planned expert with a fetch source from the RAM tier (host-mapped) into its VRAM slot.
+/// Copies every planned expert with a fetch source from the RAM tier (host-mapped) into its VRAM slot - a streamed one
+/// (STRATA_GLM_STREAM_FETCH, source | 1) chunk by chunk as the host's disk reads land.
 void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s);
 /// moe_wait then moe_fetch as ONE launch (the same effects; STRATA_GLM_SKIP_EMPTY's batched rows): a route with no
 /// disk miss and nothing to fetch costs one near-empty launch instead of two.

@@ -4339,11 +4339,83 @@ __global__ void __launch_bounds__(256) moe_prefetch_kernel(MoeDev d, size_t n16)
     }
 }
 
+// STRATA_GLM_STREAM_FETCH: the host answered before its disk reads of entry i finished (the source is tagged, | 1), and
+// each read sets a bit of the response's ready[i] once its chunk is in the landing slot.  The chunks are copied as they
+// land: the grid splits into a group of blocks a chunk, the group's first block polls the chunk's bit in host memory and
+// hands it to the group's others in device memory (landed, tagged with the response's seq: one PCIe poller a chunk, as
+// many blocks a chunk as the grid has to spare - READ_CHUNKS=2 makes only 6 chunks), and the group copies the chunk side
+// by side.  The PCIe pull runs behind the SSD instead of after it: only the last chunk's copy stays exposed.  A bit that
+// never comes (a dead host) gives up after ~60 s like moe_wait.  (A group's first block has the group's lowest index, so
+// it is never queued behind the blocks that wait for it.)
+//
+// Adapted from zephel01/Abyss d626d96d5b7aad8af90153c36ff520d464658cea, src/kernels/cuda/glm_fast.cu
+// (moe_fetch_stream_kernel).
+//
+// MIT License
+// Copyright (c) 2026 Niko1221 and the Strata contributors
+__device__ __forceinline__ void moe_fetch_streamed(const void* resp, unsigned int* landed, uint8_t* t, int i,
+                                                   unsigned long long src) {
+    __shared__ unsigned long long s_lay[3];   // the response's s_gu, s_dn, s_chunks << 32 | seq
+    const volatile MoeResponse* r = (const volatile MoeResponse*) resp;
+    __syncthreads();   // (the last entry's threads are done with s_lay)
+    if (threadIdx.x == 0) {
+        s_lay[0] = r->s_gu;
+        s_lay[1] = r->s_dn;
+        s_lay[2] = ((unsigned long long) r->s_chunks << 32) | r->seq;
+    }
+    __syncthreads();
+    const unsigned long long gu = s_lay[0], dn = s_lay[1];
+    const int rch = max(1, min(10, (int) (s_lay[2] >> 32)));   // (the host streams only 3 x chunks <= 32 bits)
+    const unsigned int seq = (unsigned int) s_lay[2];
+    const uint8_t* s = (const uint8_t*) (src & ~1ull);
+    const int nb = 3 * rch, G = (int) gridDim.x;
+    const int gpb = G >= nb ? G / nb : 1, groups = G / gpb, sub = (int) blockIdx.x % gpb;
+    if ((int) blockIdx.x >= groups * gpb) return;   // (the grid's remainder)
+    volatile unsigned int* lf = landed + (size_t) i * 32;
+    for (int bit = (int) blockIdx.x / gpb; bit < nb; bit += groups) {
+        const int part = bit / rch, c = bit % rch;
+        const unsigned long long len = part == 2 ? dn : gu;
+        const unsigned long long piece = ((len + (unsigned long long) rch - 1) / (unsigned long long) rch + 4095ull) & ~4095ull;
+        const unsigned long long c0 = min(len, (unsigned long long) c * piece), c1 = min(len, c0 + piece);
+        if (c1 <= c0) continue;
+        const unsigned long long base = (part == 0 ? 0ull : part == 1 ? gu : 2ull * gu) + c0;
+        if (threadIdx.x == 0) {
+            const long long t0 = clock64();
+            if (sub == 0) {
+                while (((r->ready[i] >> bit) & 1u) == 0u) {
+                    if (clock64() - t0 > (1ll << 36)) break;
+                }
+                __threadfence_system();
+                if (gpb > 1) {
+                    lf[bit] = seq;
+                    __threadfence();
+                }
+            } else {
+                while (lf[bit] != seq) {
+                    if (clock64() - t0 > (1ll << 36)) break;
+                }
+                __threadfence_system();
+            }
+        }
+        __syncthreads();
+        const size_t n = (size_t) (c1 - c0), n16 = n / 16, step = (size_t) gpb * blockDim.x;
+        const uint4* s4 = (const uint4*) (s + base);
+        uint4* t4 = (uint4*) (t + base);
+        for (size_t j = (size_t) sub * blockDim.x + threadIdx.x; j < n16; j += step) t4[j] = s4[j];
+        for (size_t j = n16 * 16 + (size_t) sub * blockDim.x + threadIdx.x; j < n; j += step) t[base + j] = s[base + j];
+        __syncthreads();
+    }
+}
+
 // one block per SM, 16-byte loads: the PCIe pull measured 11.5 GB/s (a little over cudaMemcpy's 10.7)
 __global__ void __launch_bounds__(256) moe_fetch_kernel(MoeDev d, int k, size_t n16) {
     for (int i = 0; i < k; ++i) {
         const unsigned long long src = d.fetch_src[i];
         if (src == 0ull) continue;
+        if (src & 1ull) {   // (STRATA_GLM_STREAM_FETCH: chunk by chunk, as the host's reads land)
+            moe_fetch_streamed(d.resp, d.landed, (uint8_t*) d.plan_ptr[i], i, src);
+            continue;
+        }
         const uint4* s = (const uint4*) src;
         uint4* t = (uint4*) d.plan_ptr[i];
         for (size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x; j < n16; j += (size_t) gridDim.x * blockDim.x)
@@ -4404,6 +4476,10 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
     for (int i = 0; i < k; ++i) {
         const unsigned long long src = s_src[i];
         if (src == 0ull) continue;
+        if (src & 1ull) {   // (STRATA_GLM_STREAM_FETCH, as moe_fetch)
+            moe_fetch_streamed(d.resp, d.landed, (uint8_t*) d.plan_ptr[i], i, src);
+            continue;
+        }
         const uint4* s = (const uint4*) src;
         uint4* t = (uint4*) d.plan_ptr[i];
         for (size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x; j < n16; j += (size_t) gridDim.x * blockDim.x)

@@ -2,6 +2,8 @@
 // against what the per-row path runs, on random Q8_0 experts (needs a GPU, no model):
 //  - moe_wait_fetch against moe_wait + moe_fetch: a route with only RAM-tier fetches, and one with a disk miss the host
 //    has answered (its source, table edits and CPU part) - the same slots, tables and parts;
+//  - STRATA_GLM_STREAM_FETCH: disk misses answered before their reads (the source | 1), both kernels, 1 to 10 chunks a
+//    part - each chunk copied only after its ready bit, the slots bit for bit the blobs;
 //  - moe_cpu_wait_rows against a moe_cpu_wait per row (rows with and without a CPU-lane answer);
 //  - a group's routed experts each once (moe_win_experts over the rows' plans, the shared expert's down rows by mv_nt)
 //    against each row's moe_gate_up (with the fused shared down) + moe_down: bit for bit, with experts shared between
@@ -11,10 +13,15 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace gf = strata::kernels::glmf;
@@ -73,7 +80,8 @@ struct Route {
 constexpr int kTab = 64;
 constexpr size_t kBlob = 40000;   // (not a multiple of 16 bytes x blocks: the copy's tail)
 
-Route route_make(gf::MoeResponse* resp_d) {
+Route route_make(gf::MoeResponse* resp_d, size_t blob = kBlob, size_t stride = 0) {   // (stride: a slot's, else blob)
+    if (stride == 0) stride = blob;
     Route r;
     r.plan_ptr = dev<unsigned long long>(8);
     r.fetch_src = dev<unsigned long long>(8);
@@ -81,9 +89,9 @@ Route route_make(gf::MoeResponse* resp_d) {
     r.wait_seq = dev<unsigned int>(1);
     r.cpu_part = dev<float>(256);
     r.cpu_flag = dev<int>(1);
-    r.slots = dev<uint8_t>(8 * kBlob);
+    r.slots = dev<uint8_t>(8 * stride);
     std::vector<unsigned long long> pp(8);
-    for (int i = 0; i < 8; ++i) pp[(size_t) i] = (unsigned long long) (r.slots + (size_t) i * kBlob);
+    for (int i = 0; i < 8; ++i) pp[(size_t) i] = (unsigned long long) (r.slots + (size_t) i * stride);
     put(r.plan_ptr, pp);
     r.d.tab = r.tab;
     r.d.plan_ptr = r.plan_ptr;
@@ -142,6 +150,84 @@ void test_wait_fetch() {
             std::fprintf(stderr, "FAIL: the disk miss's slot does not hold its source\n");
             ++g_fail;
         }
+    }
+}
+
+// ---- STRATA_GLM_STREAM_FETCH: the answer before the reads.  The "reads" here write a chunk's bytes into the host blob
+//      only right before they set its bit (the blob holds other bytes until then), so a chunk copied early shows
+void test_stream_fetch() {
+    constexpr size_t gu = 50000, dn = 37003, blob = 2 * gu + dn;   // (a down part that is no multiple of 16 bytes)
+    // slots 256-byte aligned as Maya's (glm_fast_path.cu: sstride, expert_stride): the whole-blob copy stores 16 bytes
+    // at a time up to the blob's next 16 bytes, so a slot at i * blob (odd) is a misaligned address
+    constexpr size_t stride = (blob + 255) & ~(size_t) 255;
+    auto* resp = mapped<gf::MoeResponse>(1);
+    unsigned int* landed = dev<unsigned int>(8 * 32);   // (kept over the runs: an older seq's flags must not count)
+    std::vector<uint8_t*> src(8);
+    for (auto& p : src) p = mapped<uint8_t>(stride);   // (the whole-blob copy reads up to 16 bytes past it)
+    std::vector<uint8_t> want(8 * blob);
+    for (auto& v : want) v = (uint8_t) g_rng();
+    unsigned int seq = 100;
+    for (int rch : {1, 2, 8, 10}) {
+        for (int fused = 0; fused < 2; ++fused) {
+            Route r = route_make(resp, blob, stride);
+            r.d.landed = landed;
+            ++seq;
+            for (int e = 0; e < 8; ++e) std::memset(src[(size_t) e], 0xa5 ^ e, stride);
+            // entry 1 a RAM-tier fetch, entry 4 a disk miss answered whole (the lookahead read it), 2 and 6 streamed
+            std::memcpy(src[1], want.data() + 1 * blob, blob);
+            std::memcpy(src[4], want.data() + 4 * blob, blob);
+            std::memset((void*) resp, 0, sizeof(gf::MoeResponse));
+            resp->ptr_mask = (1u << 2) | (1u << 4) | (1u << 6);
+            resp->ptr[2] = (unsigned long long) src[2] | 1ull;
+            resp->ptr[4] = (unsigned long long) src[4];
+            resp->ptr[6] = (unsigned long long) src[6] | 1ull;
+            resp->s_gu = gu;
+            resp->s_dn = dn;
+            resp->s_chunks = (unsigned int) rch;
+            std::vector<unsigned long long> fs(8, 0ull);
+            fs[1] = (unsigned long long) src[1];
+            put(r.fetch_src, fs);
+            put(r.wait_seq, std::vector<unsigned int>{seq});
+            std::atomic_thread_fence(std::memory_order_release);
+            resp->seq = seq;
+            if (fused) {
+                gf::moe_wait_fetch(r.d, 256, 8, blob, 0);
+            } else {
+                gf::moe_wait(r.d, 256, 0);
+                gf::moe_fetch(r.d, 8, blob, 0);
+            }
+            // the reads, while the kernels wait: every chunk of entries 2 and 6 in a shuffled order
+            std::vector<std::pair<int, int>> jobs;
+            for (int i : {2, 6})
+                for (int b = 0; b < 3 * rch; ++b) jobs.push_back({i, b});
+            std::shuffle(jobs.begin(), jobs.end(), g_rng);
+            for (const auto& [i, b] : jobs) {
+                const int part = b / rch, c = b % rch;
+                const size_t len = part == 2 ? dn : gu;
+                const size_t piece = ((len + (size_t) rch - 1) / (size_t) rch + 4095) & ~(size_t) 4095;
+                const size_t c0 = std::min(len, (size_t) c * piece), c1 = std::min(len, c0 + piece);
+                const size_t at = (part == 0 ? 0 : part == 1 ? gu : 2 * gu) + c0;
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                if (c1 > c0) std::memcpy(src[(size_t) i] + at, want.data() + (size_t) i * blob + at, c1 - c0);
+                std::atomic_ref<unsigned int>(resp->ready[i]).fetch_or(1u << b, std::memory_order_release);
+            }
+            CK(cudaDeviceSynchronize());
+            const auto sl = back(r.slots, 8 * stride);
+            const std::vector<uint8_t> none(blob, 0);
+            for (int i = 0; i < 8; ++i) {
+                const bool fetched = i == 1 || i == 2 || i == 4 || i == 6;
+                if (std::memcmp(sl.data() + (size_t) i * stride, fetched ? want.data() + (size_t) i * blob : none.data(),
+                                blob) != 0) {
+                    std::fprintf(stderr, "FAIL: streamed fetch (%d chunks a part, %s): entry %d's slot\n", rch,
+                                 fused ? "moe_wait_fetch" : "moe_wait + moe_fetch", i);
+                    ++g_fail;
+                }
+            }
+        }
+    }
+    if (gf::launch_errors() > 0) {
+        std::fprintf(stderr, "FAIL: %d kernel launch(es) failed\n", gf::launch_errors());
+        ++g_fail;
     }
 }
 
@@ -320,6 +406,7 @@ int main() {
         return 0;
     }
     test_wait_fetch();
+    test_stream_fetch();
     test_cpu_wait_rows();
     test_grouped_experts();
     if (g_fail == 0) std::printf("glm_moe_rows_test: ok\n");
