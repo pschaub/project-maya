@@ -722,6 +722,8 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     args = {}
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
+        if ">" not in rest:
+            raise MalformedToolCall(body)
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
         end = rest.find("</parameter>")
@@ -1391,7 +1393,17 @@ class OutputParser:
                     return out
                 body = self.buf[:i]
                 self.buf = self.buf[i + len(CALL_END):]
-                call = parse_tool_call(body, self.schemas.get(call_name(body)))
+                try:
+                    call = parse_tool_call(body, self.schemas.get(call_name(body)))
+                except MalformedToolCall:
+                    if self.strict_tools or self.scall is not None:
+                        raise           # Responses asks for exact calls; one already announced cannot be taken back
+                    # nothing of it has gone out: the client gets the text the model wrote, as an unterminated call
+                    # at the end does (finish), and the answer goes on
+                    out.append(Event("content", self._track(CALL_START + body + CALL_END)))
+                    self._reset_scan()
+                    self.state = "content"
+                    continue
                 if self.dsml is not None and "::" in call.name:
                     call.namespace = call.name.split("::", 1)[0]
                 if self.scall is not None:

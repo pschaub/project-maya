@@ -55,7 +55,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, models, savings  # noqa: E402
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
-from serve.frontend import (CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
+from serve.frontend import (CALL_START, MINIMAX_NS, ChatTemplate, Event, MalformedToolCall, OutputParser,  # noqa: E402
                             EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, deepseek_effort_kwargs, deepseek_images,
                             effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
@@ -3468,7 +3468,10 @@ class Service:
                             held = ""
                     else:
                         finish = "error"
-                        print(f"[maya] the engine reported an error: {e}", flush=True)
+                        if isinstance(e, MalformedToolCall):   # the parser's, not the engine's (issue #5's title)
+                            print(f"[maya] the model wrote a tool call that cannot be read: {e}", flush=True)
+                        else:
+                            print(f"[maya] the engine reported an error: {e}", flush=True)
                         if getattr(e, "body", None):                    # (a malformed tool call: the whole of it, #613)
                             print(f"[maya] the malformed tool call, whole ({len(e.body)} characters): {e.body!r}", flush=True)
                         raise

@@ -11,7 +11,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve.frontend import ChatTemplate, OutputParser, parse_tool_call  # noqa: E402
+from serve.frontend import ChatTemplate, MalformedToolCall, OutputParser, parse_tool_call  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -107,6 +107,52 @@ class GlmCalls(unittest.TestCase):
             self.assertEqual((got[0].name, got[0].arguments), ("get_weather", {"city": "Paris", "days": 3}), pieces)
             streamed = "".join(e.text for e in ev if e.kind == "tool_args")
             self.assertEqual(json.loads(streamed), {"city": "Paris", "days": 3}, pieces)
+
+
+class UnreadableCalls(unittest.TestCase):
+    """A call the parser cannot read is the model's output, not an engine error: nothing of it has gone out, so a
+    Chat or Messages client gets the text the model wrote and the answer goes on; Responses still fails."""
+
+    BAD = "<tool_call><arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"   # no name before the first tag
+
+    def test_returned_as_text(self):
+        for pieces in (None, 1, 3):
+            ev = run("Checking.\n\n" + self.BAD + "\n\nThat failed.", pieces)
+            self.assertEqual(calls(ev), [], pieces)
+            self.assertEqual(content(ev), "Checking." + self.BAD + "\n\nThat failed.", pieces)
+
+    def test_a_good_call_after_it_still_counts(self):
+        got = calls(run(self.BAD + "\n" + GLM, 2))
+        self.assertEqual([(c.name, c.arguments) for c in got], [("get_weather", GLM_ARGS)])
+
+    def test_strict_and_announced_calls_still_fail(self):
+        p = OutputParser(thinking=False, tools=TOOLS, stream_tools=True, strict_tools=True)
+        with self.assertRaises(MalformedToolCall):
+            p.feed(self.BAD)
+        p = OutputParser(thinking=False, tools=TOOLS, stream_tools=True)    # its name went out as a tool_start
+        with self.assertRaises(MalformedToolCall):
+            p.feed("<tool_call>get_weather junk <b></tool_call>")
+
+    def test_over_http(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "</think>\n\nChecking." + self.BAD, max_context=8192), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            tools = [{"type": "function", "function": t} for t in TOOLS]
+            r = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                       data=json.dumps({"model": "m", "tools": tools, "messages": [
+                                           {"role": "user", "content": "weather?"}]}).encode(),
+                                       headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                code, b = resp.status, json.loads(resp.read())
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(b["choices"][0]["message"]["content"], "Checking." + self.BAD)
+        self.assertFalse(b["choices"][0]["message"].get("tool_calls"))
 
 
 class QuotedCalls(unittest.TestCase):
